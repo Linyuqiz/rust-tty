@@ -1,35 +1,61 @@
-use nix::fcntl::{open, OFlag};
-use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt};
-use nix::sys::stat::Mode;
+use nix::libc::waitpid;
+use nix::pty::openpty;
+use nix::unistd::{fork, ForkResult};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::FromRawFd;
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
+use std::process::{exit, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 
 fn main() {
-    let mut master_fd = posix_openpt(OFlag::O_RDWR).unwrap();
+    let pty = openpty(None, None).expect("openpty failed");
 
-    let slave_name = unsafe { ptsname(&master_fd) }.unwrap();
+    let (master, slave) = (pty.master, pty.slave);
 
-    grantpt(&master_fd).unwrap();
-    unlockpt(&master_fd).unwrap();
+    let mut command = Command::new("zsh");
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child: pid, .. }) => {
+            spawn(move || {
+                unsafe { waitpid(i32::from(pid), &mut 0, 0) };
+                println!("process exit!");
+                exit(0);
+            });
+        }
+        Ok(ForkResult::Child) => {
+            command
+                .stdin(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
+                .stdout(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
+                .stderr(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
+                .exec();
+        }
+        _ => println!("fork failed"),
+    }
 
-    let slave_fd = open(Path::new(&slave_name), OFlag::O_RDWR, Mode::empty()).unwrap();
-
-    spawn(move || loop {
-        let mut buffer = [0u8; 1024];
-        master_fd.read(buffer.as_mut_slice()).unwrap();
-
-        println!("received data: {}", String::from_utf8_lossy(&buffer));
+    let mut pty_out = unsafe { File::from_raw_fd(master.as_raw_fd()) };
+    spawn(move || {
+        let mut buf = [0; 10240];
+        loop {
+            let msg_size = pty_out.read(buf.as_mut()).expect("read failed");
+            if msg_size == 0 {
+                continue;
+            }
+            print!("{}", String::from_utf8_lossy(&buf[..msg_size]).to_string());
+        }
     });
 
-    let mut slave_file = unsafe { File::from_raw_fd(slave_fd) };
+    let pty_in = unsafe { File::from_raw_fd(master.as_raw_fd()) };
+    let rc_pty_in = Arc::new(Mutex::new(pty_in));
     loop {
-        slave_file
-            .write("ls -l\n".as_bytes())
-            .expect("Failed to write to slave");
+        let mut input_cmd = String::new();
+        std::io::stdin()
+            .read_line(&mut input_cmd)
+            .expect("read failed");
 
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        let mut writer = rc_pty_in.lock().expect("lock failed");
+        writer
+            .write_all(input_cmd.as_bytes())
+            .expect("write failed");
     }
 }
