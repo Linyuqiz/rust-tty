@@ -1,6 +1,6 @@
 use nix::libc::waitpid;
-use nix::pty::openpty;
-use nix::unistd::{fork, ForkResult};
+use nix::pty::forkpty;
+use nix::unistd::ForkResult;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -10,42 +10,47 @@ use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 
 fn main() {
-    let pty = openpty(None, None).expect("openpty failed");
+    let pty = unsafe { forkpty(None, None).expect("fork failed") };
 
-    let (master, slave) = (pty.master, pty.slave);
+    let (master, slave) = (
+        pty.master.try_clone().expect("failed to clone master"),
+        pty.master.try_clone().expect("failed to clone slave"),
+    );
 
-    let mut command = Command::new("zsh");
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child: pid, .. }) => {
+    let mut cmd = Command::new("bash");
+    match pty.fork_result {
+        ForkResult::Parent { child: pid, .. } => {
             spawn(move || {
-                unsafe { waitpid(i32::from(pid), &mut 0, 0) };
+                unsafe { waitpid(pid.as_raw(), &mut 0, 0) };
                 println!("process exit!");
                 exit(0);
             });
         }
-        Ok(ForkResult::Child) => {
-            command
-                .stdin(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
+        ForkResult::Child => {
+            cmd.stdin(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
                 .stdout(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
                 .stderr(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
                 .exec();
         }
-        _ => println!("fork failed"),
     }
 
     let mut pty_out = unsafe { File::from_raw_fd(master.as_raw_fd()) };
     spawn(move || {
-        let mut buf = [0; 10240];
+        let mut buffer = [0; 10240];
         loop {
-            let msg_size = pty_out.read(buf.as_mut()).expect("read failed");
-            if msg_size == 0 {
+            let msg_length = pty_out.read(buffer.as_mut()).expect("read failed");
+            if msg_length == 0 {
                 continue;
             }
-            print!("{}", String::from_utf8_lossy(&buf[..msg_size]).to_string());
+            print!(
+                "{}",
+                String::from_utf8_lossy(&buffer[..msg_length]).to_string()
+            );
         }
     });
 
     let pty_in = unsafe { File::from_raw_fd(master.as_raw_fd()) };
+
     let rc_pty_in = Arc::new(Mutex::new(pty_in));
     loop {
         let mut input_cmd = String::new();
