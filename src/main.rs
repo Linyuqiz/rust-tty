@@ -9,6 +9,8 @@ use std::process::{exit, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 
+static DEFAUL_COMMAND_SHELL: &str = "zsh";
+
 fn main() {
     let pty = unsafe { forkpty(None, None).expect("fork failed") };
 
@@ -17,9 +19,9 @@ fn main() {
         pty.master.try_clone().expect("failed to clone slave"),
     );
 
-    let mut cmd = Command::new("bash");
     match pty.fork_result {
         ForkResult::Parent { child: pid, .. } => {
+            println!("Welcom to Rust TTY!");
             spawn(move || {
                 unsafe { waitpid(pid.as_raw(), &mut 0, 0) };
                 println!("process exit!");
@@ -27,7 +29,8 @@ fn main() {
             });
         }
         ForkResult::Child => {
-            cmd.stdin(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
+            Command::new(DEFAUL_COMMAND_SHELL)
+                .stdin(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
                 .stdout(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
                 .stderr(unsafe { Stdio::from_raw_fd(slave.as_raw_fd()) })
                 .exec();
